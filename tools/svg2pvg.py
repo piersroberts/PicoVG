@@ -30,9 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import svg2tvg  # noqa: E402
 from simplify import simplify  # noqa: E402
 from svg2tvg import (  # noqa: E402
-    IDENTITY, SVG_NS, XLINK_HREF, Converter, encode_style,
-    mat_apply, mat_mul, parse_transform, point, scale, style_kind, transform_subpaths,
-    unit, varuint, viewbox_matrix,
+    DEFAULT_STYLE, IDENTITY, SVG_NS, Converter, encode_style, mat_apply, mat_mul, mat_scale,
+    page_matrix, parse_transform, point, scale, style_kind, transform_subpaths, unit, varuint,
 )
 
 CMD_USE = 11
@@ -48,8 +47,6 @@ USE_ROTATE = 0x08
 USE_MATRIX = 0x10
 USE_COLOUR = 0x20
 USE_HALF_TURN = 0x40
-
-DEFAULT_STYLE = {"fill": "black", "stroke": "none", "stroke-width": "1"}
 
 # Max distance, in SVG units, that simplified paths may move.
 TOLERANCE = 0.0
@@ -68,10 +65,6 @@ class Symbol:
         self.uses = 0
         self.max_scale = 0.0
         self.index = None
-
-
-def mat_scale(m):
-    return math.sqrt(abs(m[0] * m[3] - m[1] * m[2]))
 
 
 def canonical(el):
@@ -93,8 +86,7 @@ def geometry_key(commands, tint):
 
 class Bundle(Converter):
     def __init__(self):
-        self.colours = []
-        self.warnings = []
+        super().__init__()
         self.symbols = []
         self.by_source = {}    # (xml, style) -> (symbol, colour)
         self.by_geometry = {}  # geometry key -> symbol
@@ -109,26 +101,23 @@ class Bundle(Converter):
         return (canonical(el), tuple(sorted(s.items())))
 
     def walk(self, el, m, s):
-        if self.in_symbol:
-            return super().walk(el, m, s)
+        # Symbols are stored once, so clipped content is drawn inline.
+        if self.in_symbol or self.clip is not None or el.get("clip-path"):
+            if not self.counting:
+                super().walk(el, m, s)
+            return
         if not el.tag.startswith(SVG_NS) or self.hidden(el, self.style(el, s)):
             return
         tag = el.tag.replace(SVG_NS, "")
         if tag == "use":
-            target = self.ids[el.get(XLINK_HREF, el.get("href", ""))[1:]]
+            target = self.href(el)
             if target.tag == SVG_NS + "symbol" and target.get("viewBox"):
                 if self.counting:
                     return
                 s = self.style(el, s)
                 if el.get("transform"):
                     m = mat_mul(m, parse_transform(el.get("transform")))
-                vb = [float(v) for v in target.get("viewBox").split()]
-                x, y = float(el.get("x", 0)), float(el.get("y", 0))
-                w = float(el.get("width", vb[2]))
-                h = float(el.get("height", vb[3]))
-                inner = mat_mul(m, viewbox_matrix(vb, x, y, w, h, target.get("preserveAspectRatio")))
-                ts = self.style(target, s)
-                self.add_use(target, list(target), ts, inner)
+                self.add_use(target, list(target), self.style(target, s), self.symbol_matrix(el, target, m))
                 return
         if tag in ("path", "rect"):
             key = self.element_key(el, self.style(el, s))
@@ -148,7 +137,7 @@ class Bundle(Converter):
         super().walk(el, m, s)
 
     def add_use(self, source, children, s, m):
-        key = (canonical(source), tuple(sorted(s.items())))
+        key = self.element_key(source, s)
         if key not in self.by_source:
             saved = self.commands
             self.commands = []
@@ -179,26 +168,22 @@ class Bundle(Converter):
 
     def load(self, path):
         root = ET.parse(path).getroot()
-        self.root = root
-        self.ids = {el.get("id"): el for el in root.iter() if el.get("id")}
+        self.set_root(root)
         self.file_id = path
         return root
 
     def count(self, path):
         root = self.load(path)
         self.counting = True
-        vb = [float(v) for v in root.get("viewBox").split()]
-        m = viewbox_matrix(vb, 0, 0, round(vb[2]), round(vb[3]), root.get("preserveAspectRatio"))
+        _, _, m = page_matrix(root)
         for child in root:
             self.walk(child, m, dict(DEFAULT_STYLE))
         self.counting = False
 
     def add_image(self, path):
         root = self.load(path)
-        vb = [float(v) for v in root.get("viewBox").split()]
-        width, height = round(vb[2]), round(vb[3])
+        width, height, m = page_matrix(root)
         self.page = (width, height)
-        m = viewbox_matrix(vb, 0, 0, width, height, root.get("preserveAspectRatio"))
         self.commands = []
         for child in root:
             self.walk(child, m, dict(DEFAULT_STYLE))

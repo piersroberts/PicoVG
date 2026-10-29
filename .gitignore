@@ -1,8 +1,13 @@
 # Built binaries
 pvg2png
 tvgsheet
+pvgdiff
+
+# Test inputs and outputs, see the Makefile
+tests/
 
 # Python
+.venv/
 __pycache__/
 
 # macOS

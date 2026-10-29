@@ -3,19 +3,22 @@
 
 Covers this SVG subset: svg, g, use, symbol,
 path, rect, circle, ellipse, userSpaceOnUse patterns and two stop linear and
-radial gradients. TinyVG fills are even-odd, so non-zero fills whose subpaths
-overlap are split into fills that cover the same area. TinyVG has no transforms, so every point is
-transformed here. Arcs and rounded rects become cubic beziers so they
-survive rotation and non-uniform scale.
+radial gradients, and clip-path on fills. TinyVG fills are even-odd, so
+non-zero fills that would draw differently are rebuilt without overlaps.
+TinyVG has no transforms, so every point is transformed here. Arcs and
+rounded rects become cubic beziers so they survive rotation and non-uniform
+scale.
 
 Usage: svg2tvg.py in.svg out.tvg
 """
 
 import math
-import re
 import struct
 import sys
 import xml.etree.ElementTree as ET
+
+import pathops
+import svgelements
 
 SVG_NS = "{http://www.w3.org/2000/svg}"
 XLINK_HREF = "{http://www.w3.org/1999/xlink}href"
@@ -24,16 +27,10 @@ XLINK_HREF = "{http://www.w3.org/1999/xlink}href"
 # Fewer fraction bits make the low bytes repeat more, so files gzip better.
 SCALE_BITS = 3
 
-NAMED_COLOURS = {
-    "black": (0, 0, 0),
-    "white": (255, 255, 255),
-    "red": (255, 0, 0),
-    "blue": (0, 0, 255),
-    "green": (0, 128, 0),
-    "navy": (0, 0, 128),
-}
-
 IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+# SVG initial values for the properties the converter reads.
+DEFAULT_STYLE = {"fill": "black", "stroke": "none", "stroke-width": "1"}
 
 
 # ---------------------------------------------------------------- matrices
@@ -66,139 +63,81 @@ def scale(sx, sy):
     return (sx, 0.0, 0.0, sy, 0.0, 0.0)
 
 
-def rotate(deg):
-    r = math.radians(deg)
-    cs, sn = math.cos(r), math.sin(r)
-    return (cs, sn, -sn, cs, 0.0, 0.0)
+def mat_scale(m):
+    """How much the matrix scales lengths, for line widths."""
+    return math.sqrt(abs(m[0] * m[3] - m[1] * m[2]))
+
+
+def from_matrix(mx):
+    return (mx.a, mx.b, mx.c, mx.d, mx.e, mx.f)
 
 
 def parse_transform(text):
-    m = IDENTITY
-    for name, args in re.findall(r"(\w+)\s*\(([^)]*)\)", text or ""):
-        v = [float(x) for x in re.split(r"[\s,]+", args.strip()) if x]
-        if name == "translate":
-            t = translate(v[0], v[1] if len(v) > 1 else 0.0)
-        elif name == "scale":
-            t = scale(v[0], v[1] if len(v) > 1 else v[0])
-        elif name == "rotate":
-            t = rotate(v[0])
-            if len(v) == 3:
-                t = mat_mul(translate(v[1], v[2]), mat_mul(t, translate(-v[1], -v[2])))
-        elif name == "matrix":
-            t = tuple(v)
-        else:
-            raise ValueError(f"unsupported transform {name}")
-        m = mat_mul(m, t)
-    return m
+    return from_matrix(svgelements.Matrix(text or ""))
 
 
 def viewbox_matrix(viewbox, x, y, w, h, par):
     """Map a viewBox into the viewport (x, y, w, h) per preserveAspectRatio."""
     vx, vy, vw, vh = viewbox
-    sx, sy = w / vw, h / vh
-    align = (par or "xMidYMid meet").split()[0]
-    if align != "none":
-        slice_ = "slice" in (par or "")
-        s = max(sx, sy) if slice_ else min(sx, sy)
-        sx = sy = s
-    tx, ty = x - vx * sx, y - vy * sy
-    if align != "none":
-        free_x, free_y = w - vw * sx, h - vh * sy
-        if "xMid" in align:
-            tx += free_x / 2
-        elif "xMax" in align:
-            tx += free_x
-        if "YMid" in align:
-            ty += free_y / 2
-        elif "YMax" in align:
-            ty += free_y
-    return (sx, 0.0, 0.0, sy, tx, ty)
+    return parse_transform(svgelements.Viewbox.viewbox_transform(x, y, w, h, vx, vy, vw, vh, par))
 
 
 # ------------------------------------------------------------- path parser
 
-NUMBER_RE = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+def xy(p):
+    return (float(p.x), float(p.y))
 
 
-class PathScanner:
-    def __init__(self, d):
-        self.d = d
-        self.i = 0
+def path_subpaths(path):
+    """An svgelements Path as subpaths of absolute ops.
 
-    def skip(self):
-        while self.i < len(self.d) and self.d[self.i] in " \t\r\n,":
-            self.i += 1
-
-    def at_number(self):
-        self.skip()
-        return self.i < len(self.d) and (self.d[self.i] in "+-." or self.d[self.i].isdigit())
-
-    def command(self):
-        self.skip()
-        if self.i >= len(self.d):
-            return None
-        c = self.d[self.i]
-        if not c.isalpha():
-            raise ValueError(f"expected path command at {self.i}: {self.d[self.i:self.i+20]!r}")
-        self.i += 1
-        return c
-
-    def number(self):
-        self.skip()
-        m = NUMBER_RE.match(self.d, self.i)
-        if not m:
-            raise ValueError(f"expected number at {self.i}: {self.d[self.i:self.i+20]!r}")
-        self.i = m.end()
-        return float(m.group())
-
-    def flag(self):
-        # Arc flags may be packed with no separator, e.g. "a1 1 0 0110 10".
-        self.skip()
-        c = self.d[self.i]
-        self.i += 1
-        return c == "1"
+    Each subpath is (start, ops). Ops are ("L", p), ("Q", c, p),
+    ("C", c1, c2, p) and ("Z",). Arcs become one cubic per quarter turn.
+    """
+    subpaths = []
+    ops = None
+    for seg in path:
+        if isinstance(seg, svgelements.Move):
+            ops = []
+            subpaths.append((xy(seg.end), ops))
+            continue
+        if ops is None:
+            # A command after Z without M starts a new subpath at the start.
+            ops = []
+            subpaths.append((xy(seg.start), ops))
+        if isinstance(seg, svgelements.Close):
+            ops.append(("Z",))
+            ops = None
+        elif isinstance(seg, svgelements.Line):
+            ops.append(("L", xy(seg.end)))
+        elif isinstance(seg, svgelements.QuadraticBezier):
+            ops.append(("Q", xy(seg.control), xy(seg.end)))
+        elif isinstance(seg, svgelements.CubicBezier):
+            ops.append(("C", xy(seg.control1), xy(seg.control2), xy(seg.end)))
+        elif isinstance(seg, svgelements.Arc):
+            if seg.start == seg.end:
+                continue
+            if seg.rx == 0 or seg.ry == 0:
+                ops.append(("L", xy(seg.end)))
+                continue
+            for c1, c2, end in arc_cubics(seg):
+                ops.append(("C", c1, c2, end))
+    return [(s, o) for s, o in subpaths if o]
 
 
-def arc_to_cubics(p0, rx, ry, phi_deg, large, sweep, p1):
-    """SVG endpoint arc to a list of (c1, c2, end) cubics."""
-    if p0 == p1:
-        return []
-    if rx == 0 or ry == 0:
-        return [(p0, p1, p1)]
-    rx, ry = abs(rx), abs(ry)
-    phi = math.radians(phi_deg)
-    cp, sp = math.cos(phi), math.sin(phi)
-    dx, dy = (p0[0] - p1[0]) / 2, (p0[1] - p1[1]) / 2
-    x1 = cp * dx + sp * dy
-    y1 = -sp * dx + cp * dy
-    lam = (x1 * x1) / (rx * rx) + (y1 * y1) / (ry * ry)
-    if lam > 1:
-        s = math.sqrt(lam)
-        rx, ry = rx * s, ry * s
-    num = rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1
-    den = rx * rx * y1 * y1 + ry * ry * x1 * x1
-    coef = math.sqrt(max(0.0, num / den)) if den else 0.0
-    if large == sweep:
-        coef = -coef
-    cx1 = coef * rx * y1 / ry
-    cy1 = -coef * ry * x1 / rx
-    cx = cp * cx1 - sp * cy1 + (p0[0] + p1[0]) / 2
-    cy = sp * cx1 + cp * cy1 + (p0[1] + p1[1]) / 2
+def arc_cubics(arc):
+    """An arc as (c1, c2, end) cubics, one per quarter turn or less.
 
-    def angle(ux, uy, vx, vy):
-        a = math.atan2(ux * vy - uy * vx, ux * vx + uy * vy)
-        return a
-
-    t1 = angle(1, 0, (x1 - cx1) / rx, (y1 - cy1) / ry)
-    dt = angle((x1 - cx1) / rx, (y1 - cy1) / ry, (-x1 - cx1) / rx, (-y1 - cy1) / ry)
-    if not sweep and dt > 0:
-        dt -= 2 * math.pi
-    elif sweep and dt < 0:
-        dt += 2 * math.pi
-
-    n = max(1, math.ceil(abs(dt) / (math.pi / 2) - 1e-9))
-    step = dt / n
+    Uses k = 4/3 tan(step/4), which is closer to a circle than the
+    formula in svgelements' as_cubic_curves().
+    """
+    n = max(1, math.ceil(abs(arc.sweep) / (math.pi / 2) - 1e-9))
+    step = arc.sweep / n
     k = 4 / 3 * math.tan(step / 4)
+    rx, ry = arc.rx, arc.ry
+    cx, cy = xy(arc.center)
+    rot = float(arc.get_rotation())
+    cp, sp = math.cos(rot), math.sin(rot)
 
     def point(t):
         x, y = rx * math.cos(t), ry * math.sin(t)
@@ -209,230 +148,78 @@ def arc_to_cubics(p0, rx, ry, phi_deg, large, sweep, p1):
         return (cp * x - sp * y, sp * x + cp * y)
 
     out = []
-    t = t1
+    t = arc.get_start_t()
     for i in range(n):
-        ta, tb = t, t + step
-        pa, pb = point(ta), point(tb)
-        da, db = deriv(ta), deriv(tb)
+        pa, pb = point(t), point(t + step)
+        da, db = deriv(t), deriv(t + step)
         c1 = (pa[0] + k * da[0], pa[1] + k * da[1])
         c2 = (pb[0] - k * db[0], pb[1] - k * db[1])
-        end = p1 if i == n - 1 else pb
-        out.append((c1, c2, end))
-        t = tb
+        out.append((c1, c2, xy(arc.end) if i == n - 1 else pb))
+        t += step
     return out
 
 
 def parse_path(d):
-    """Parse path data into subpaths of absolute ops, in local coordinates.
-
-    Each subpath is (start, ops). Ops are ("L", p), ("Q", c, p),
-    ("C", c1, c2, p) and ("Z",).
-    """
-    sc = PathScanner(d)
-    subpaths = []
-    cur = (0.0, 0.0)
-    start = (0.0, 0.0)
-    ops = None
-    last_cmd = None
-    last_ctrl = None
-    cmd = None
-
-    def new_subpath(p):
-        nonlocal ops, start
-        ops = []
-        start = p
-        subpaths.append((p, ops))
-
-    while True:
-        if sc.at_number() and cmd is not None:
-            pass  # implicit repeat of the previous command
-        else:
-            cmd = sc.command()
-            if cmd is None:
-                break
-        rel = cmd.islower()
-        c = cmd.upper()
-        ox, oy = cur if rel else (0.0, 0.0)
-
-        def pt():
-            x = sc.number()
-            y = sc.number()
-            return (x + ox, y + oy)
-
-        if c == "M":
-            p = pt()
-            new_subpath(p)
-            cur = p
-            # Further pairs after a moveto are implicit linetos.
-            cmd = "l" if rel else "L"
-            last_ctrl = None
-            last_cmd = "M"
-            continue
-        if ops is None:
-            new_subpath(cur)
-        if c == "Z":
-            ops.append(("Z",))
-            cur = start
-            # A command after Z without M starts a new subpath at the start.
-            ops = None
-            cmd = None
-            last_ctrl = None
-            last_cmd = "Z"
-            continue
-        if c == "L":
-            p = pt()
-            ops.append(("L", p))
-            last_ctrl = None
-        elif c == "H":
-            x = sc.number() + ox
-            p = (x, cur[1])
-            ops.append(("L", p))
-            last_ctrl = None
-        elif c == "V":
-            y = sc.number() + (oy if rel else 0.0)
-            p = (cur[0], y)
-            ops.append(("L", p))
-            last_ctrl = None
-        elif c == "C":
-            c1, c2, p = pt(), pt(), pt()
-            ops.append(("C", c1, c2, p))
-            last_ctrl = c2
-        elif c == "S":
-            if last_cmd in ("C", "S") and last_ctrl:
-                c1 = (2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1])
-            else:
-                c1 = cur
-            c2, p = pt(), pt()
-            ops.append(("C", c1, c2, p))
-            last_ctrl = c2
-        elif c == "Q":
-            q, p = pt(), pt()
-            ops.append(("Q", q, p))
-            last_ctrl = q
-        elif c == "T":
-            if last_cmd in ("Q", "T") and last_ctrl:
-                q = (2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1])
-            else:
-                q = cur
-            p = pt()
-            ops.append(("Q", q, p))
-            last_ctrl = q
-        elif c == "A":
-            rx, ry, phi = sc.number(), sc.number(), sc.number()
-            large, sweep = sc.flag(), sc.flag()
-            p = pt()
-            for c1, c2, e in arc_to_cubics(cur, rx, ry, phi, large, sweep, p):
-                ops.append(("C", c1, c2, e))
-            last_ctrl = None
-        else:
-            raise ValueError(f"unsupported path command {cmd}")
-        cur = p
-        last_cmd = c
-    return [(s, o) for s, o in subpaths if o]
+    return path_subpaths(svgelements.Path(d))
 
 
 def rect_path(x, y, w, h, rx, ry):
-    if rx is None and ry is None:
-        rx = ry = 0.0
-    rx = ry if rx is None else rx
-    ry = rx if ry is None else ry
-    rx, ry = min(rx, w / 2), min(ry, h / 2)
-    if rx == 0 or ry == 0:
-        d = f"M{x} {y}H{x + w}V{y + h}H{x}Z"
-    else:
-        d = (
-            f"M{x + rx} {y}H{x + w - rx}A{rx} {ry} 0 0 1 {x + w} {y + ry}"
-            f"V{y + h - ry}A{rx} {ry} 0 0 1 {x + w - rx} {y + h}"
-            f"H{x + rx}A{rx} {ry} 0 0 1 {x} {y + h - ry}"
-            f"V{y + ry}A{rx} {ry} 0 0 1 {x + rx} {y}Z"
-        )
-    return parse_path(d)
+    return path_subpaths(svgelements.Path(svgelements.Rect(x, y, w, h, rx=rx, ry=ry)))
 
 
 def ellipse_path(cx, cy, rx, ry):
-    return parse_path(
-        f"M{cx + rx} {cy}A{rx} {ry} 0 0 1 {cx} {cy + ry}A{rx} {ry} 0 0 1 {cx - rx} {cy}"
-        f"A{rx} {ry} 0 0 1 {cx} {cy - ry}A{rx} {ry} 0 0 1 {cx + rx} {cy}Z"
-    )
+    return path_subpaths(svgelements.Path(svgelements.Ellipse(cx, cy, rx, ry)))
 
 
-def flatten(start, ops, steps=8):
-    """The subpath as a polygon, with curves cut into straight steps."""
-    pts = [start]
-    cur = start
-    for op in ops:
-        if op[0] == "L":
-            pts.append(op[1])
-        elif op[0] in ("Q", "C"):
-            ctrl = [cur] + list(op[1:])
-            for k in range(1, steps + 1):
-                t = k / steps
-                q = ctrl
-                while len(q) > 1:
-                    q = [(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t) for a, b in zip(q, q[1:])]
-                pts.append(q[0])
-        cur = start if op[0] == "Z" else op[-1]
-    return pts
+# Areas below this, in square units, count as empty.
+AREA_EPS = 1e-4
 
 
-def signed_area(poly):
-    return sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(poly, poly[1:] + poly[:1])) / 2
+def to_skia(subpaths, evenodd=False):
+    path = pathops.Path(fillType=pathops.FillType.EVEN_ODD if evenodd else pathops.FillType.WINDING)
+    for start, ops in subpaths:
+        path.moveTo(*start)
+        for op in ops:
+            if op[0] == "L":
+                path.lineTo(*op[1])
+            elif op[0] == "Q":
+                path.quadTo(*op[1], *op[2])
+            elif op[0] == "C":
+                path.cubicTo(*op[1], *op[2], *op[3])
+        # Fills close every subpath.
+        path.close()
+    return path
 
 
-def winding(poly, p):
-    w = 0
-    x, y = p
-    for a, b in zip(poly, poly[1:] + poly[:1]):
-        if a[1] <= y < b[1] or b[1] <= y < a[1]:
-            cross = (b[0] - a[0]) * (y - a[1]) - (x - a[0]) * (b[1] - a[1])
-            if (cross > 0) == (b[1] > a[1]):
-                w += 1 if b[1] > a[1] else -1
-    return w
+def from_skia(path):
+    subpaths, ops = [], None
+    for verb, pts in path.segments:
+        if verb == "moveTo":
+            ops = []
+            subpaths.append((pts[0], ops))
+        elif verb == "lineTo":
+            ops.append(("L", pts[0]))
+        elif verb == "qCurveTo":
+            ops.append(("Q", pts[0], pts[1]))
+        elif verb == "curveTo":
+            ops.append(("C", pts[0], pts[1], pts[2]))
+        elif verb == "closePath":
+            ops.append(("Z",))
+    return [(st, o) for st, o in subpaths if o]
 
 
-def poly_bbox(poly):
-    xs, ys = [p[0] for p in poly], [p[1] for p in poly]
-    return (min(xs), min(ys), max(xs), max(ys))
+def nonzero_to_evenodd(subpaths):
+    """A non-zero fill as subpaths that fill the same area under even-odd.
 
-
-def nonzero_groups(subpaths):
-    """Split a non-zero fill into even-odd fills whose union matches it.
-
-    Even-odd and non-zero agree unless two subpaths wound the same way
-    overlap. Then each subpath wound the main way gets its own fill, and
-    each hole goes with the smallest such subpath around it.
+    The two rules only differ where the path overlaps itself wound the same
+    way. Paths where they agree come back unchanged. The rest are rebuilt
+    by Skia without overlaps.
     """
-    if len(subpaths) < 2:
-        return [subpaths]
-    polys = [flatten(st, ops) for st, ops in subpaths]
-    areas = [signed_area(p) for p in polys]
-    boxes = [poly_bbox(p) for p in polys]
-
-    def inside(i, pts):
-        return any(winding(polys[i], p) != 0 for p in pts)
-
-    clash = False
-    for i in range(len(polys)):
-        for j in range(len(polys)):
-            if (i != j and (areas[i] > 0) == (areas[j] > 0) and boxes_overlap(boxes[i], boxes[j])
-                    and inside(i, polys[j][::max(1, len(polys[j]) // 16)])):
-                clash = True
-                break
-        if clash:
-            break
-    if not clash:
-        return [subpaths]
-    main = areas[max(range(len(areas)), key=lambda k: abs(areas[k]))] > 0
-    groups = {i: [i] for i in range(len(polys)) if (areas[i] > 0) == main}
-    for i in range(len(polys)):
-        if i in groups:
-            continue
-        around = [k for k in groups if inside(k, polys[i][:1])]
-        if around:
-            groups[min(around, key=lambda k: abs(areas[k]))].append(i)
-        else:
-            groups[i] = [i]
-    return [[subpaths[k] for k in sorted(g)] for _, g in sorted(groups.items())]
+    nonzero = to_skia(subpaths)
+    if abs(pathops.op(nonzero, to_skia(subpaths, True), pathops.PathOp.XOR).area) < AREA_EPS:
+        return subpaths
+    nonzero.simplify()
+    return from_skia(nonzero)
 
 
 def transform_subpaths(m, subpaths):
@@ -449,10 +236,10 @@ def transform_subpaths(m, subpaths):
 
 def parse_length(text):
     """A length like "1.5", "1.5px" or "2pt", in user units."""
-    m = re.match(r"\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*(px|pt|mm|cm|in)?\s*$", text)
-    if not m:
+    v = svgelements.Length(text).value(ppi=96)
+    if not isinstance(v, float | int):
         raise ValueError(f"unsupported length {text!r}")
-    return float(m.group(1)) * {None: 1, "px": 1, "pt": 4 / 3, "mm": 96 / 25.4, "cm": 96 / 2.54, "in": 96}[m.group(2)]
+    return float(v)
 
 
 def parse_css(text):
@@ -466,15 +253,8 @@ def parse_css(text):
 
 
 def parse_colour(text):
-    text = text.strip()
-    if text in NAMED_COLOURS:
-        return NAMED_COLOURS[text]
-    if text.startswith("#"):
-        h = text[1:]
-        if len(h) == 3:
-            h = "".join(ch * 2 for ch in h)
-        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
-    raise ValueError(f"unsupported colour {text}")
+    c = svgelements.Color(text.strip())
+    return (c.red, c.green, c.blue)
 
 
 def parse_offset(text):
@@ -507,12 +287,28 @@ def inside_round_rect(p, x, y, w, h, rx, ry):
 
 
 class Converter:
-    def __init__(self, root):
-        self.root = root
-        self.ids = {el.get("id"): el for el in root.iter() if el.get("id")}
+    def __init__(self, root=None):
+        self.set_root(root)
         self.colours = []
         self.commands = []  # dicts: kind ("fill"|"line"), colour, width, subpaths
         self.warnings = []
+        self.clip = None  # pathops.Path in output coordinates, or None
+
+    def set_root(self, root):
+        self.root = root
+        self.ids = {el.get("id"): el for el in root.iter() if el.get("id")} if root is not None else {}
+
+    def href(self, el):
+        """The element a <use> points at."""
+        return self.ids[el.get(XLINK_HREF, el.get("href", ""))[1:]]
+
+    def symbol_matrix(self, el, target, m):
+        """Maps the <symbol> target's viewBox into the box of the <use> el."""
+        vb = [float(v) for v in target.get("viewBox").split()]
+        x, y = float(el.get("x", 0)), float(el.get("y", 0))
+        w = float(el.get("width", vb[2]))
+        h = float(el.get("height", vb[3]))
+        return mat_mul(m, viewbox_matrix(vb, x, y, w, h, target.get("preserveAspectRatio")))
 
     def colour_index(self, rgb, alpha=1.0):
         rgba = tuple(rgb) + (max(0, min(255, round(alpha * 255))),)
@@ -610,28 +406,36 @@ class Converter:
         if not subpaths:
             return
         fill = s["fill"]
-        width = parse_length(s["stroke-width"]) * math.sqrt(abs(m[0] * m[3] - m[1] * m[2]))
+        width = parse_length(s["stroke-width"]) * mat_scale(m)
         if self.off_page(transform_subpaths(m, subpaths), width):
             return
         if fill.startswith("url(") and self.ids[fill[5:-1]].tag == SVG_NS + "pattern":
+            if self.clip is not None:
+                self.warnings.append("ignored clip-path on a pattern fill")
             self.emit_pattern(m, s, fill[5:-1], pattern_rect)
         elif fill != "none":
             colour, grad = self.paint(fill, m, s, "fill", subpaths)
             tsub = transform_subpaths(m, subpaths)
-            groups = [tsub] if s.get("fill-rule") == "evenodd" else nonzero_groups(tsub)
-            for group in groups:
-                box = bbox(group)
+            evenodd = s.get("fill-rule") == "evenodd"
+            if self.clip is not None:
+                tsub = from_skia(pathops.op(to_skia(tsub, evenodd), self.clip, pathops.PathOp.INTERSECTION))
+            elif not evenodd:
+                tsub = nonzero_to_evenodd(tsub)
+            if tsub:
+                box = bbox(tsub)
                 prev = self.commands[-1] if self.commands else None
                 # Even-odd only changes overlapping shapes, so a same coloured
                 # shape that overlaps nothing in the previous fill can join it.
                 if (prev and prev["kind"] == "fill" and prev["colour"] == colour and prev.get("grad") == grad
                         and not any(boxes_overlap(box, b) for b in prev["boxes"])):
-                    prev["subpaths"].extend(group)
+                    prev["subpaths"].extend(tsub)
                     prev["boxes"].append(box)
                 else:
                     self.commands.append({"kind": "fill", "colour": colour, "grad": grad,
-                                          "subpaths": group, "boxes": [box]})
+                                          "subpaths": tsub, "boxes": [box]})
         stroke = s["stroke"]
+        if stroke != "none" and self.clip is not None:
+            self.warnings.append("ignored clip-path on a stroke")
         if stroke != "none":
             colour, grad = self.paint(stroke, m, s, "stroke", subpaths)
             tsub = transform_subpaths(m, subpaths)
@@ -655,7 +459,7 @@ class Converter:
         tile = []
         for child in pat:
             if child.tag == SVG_NS + "path":
-                cs = self.style(child, {"fill": "black", "stroke": "none", "stroke-width": "1"})
+                cs = self.style(child, DEFAULT_STYLE)
                 tile.append((cs["fill"], parse_path(child.get("d"))))
         by_colour = {}
         ty = math.floor(y / ph) * ph
@@ -692,27 +496,65 @@ class Converter:
             return
         if el.get("transform"):
             m = mat_mul(m, parse_transform(el.get("transform")))
+        saved_clip = self.clip
         if el.get("clip-path"):
-            self.warnings.append("ignored clip-path (TinyVG has no clipping)")
+            self.clip = self.clip_region(el.get("clip-path"), m)
+        self.walk_shape(el, tag, m, s)
+        self.clip = saved_clip
+
+    def clip_region(self, ref, m):
+        """The clip-path ref as a pathops.Path, intersected with any outer clip."""
+        cp = self.ids[ref.strip()[5:-1]]
+        if cp.get("clipPathUnits") == "objectBoundingBox":
+            self.warnings.append("ignored clip-path with objectBoundingBox units")
+            return self.clip
+        if cp.get("transform"):
+            m = mat_mul(m, parse_transform(cp.get("transform")))
+        region = pathops.Path()
+        for child in cp:
+            tag = child.tag.replace(SVG_NS, "")
+            cm = mat_mul(m, parse_transform(child.get("transform"))) if child.get("transform") else m
+            evenodd = parse_css(child.get("style")).get("clip-rule", child.get("clip-rule")) == "evenodd"
+            sub = self.shape_subpaths(child, tag)
+            if sub:
+                region = pathops.op(region, to_skia(transform_subpaths(cm, sub), evenodd), pathops.PathOp.UNION)
+        if self.clip is not None:
+            region = pathops.op(region, self.clip, pathops.PathOp.INTERSECTION)
+        return region
+
+    def shape_subpaths(self, el, tag):
+        """Subpaths of a path, rect, circle or ellipse, else None."""
+        if tag == "path":
+            return parse_path(el.get("d", ""))
+        if tag == "rect":
+            x, y = float(el.get("x", 0)), float(el.get("y", 0))
+            w, h = float(el.get("width")), float(el.get("height"))
+            rx = float(el.get("rx")) if el.get("rx") else None
+            ry = float(el.get("ry")) if el.get("ry") else None
+            return rect_path(x, y, w, h, rx, ry)
+        if tag in ("circle", "ellipse"):
+            cx, cy = float(el.get("cx", 0)), float(el.get("cy", 0))
+            rx = float(el.get("r" if tag == "circle" else "rx", 0))
+            ry = float(el.get("r" if tag == "circle" else "ry", 0))
+            return ellipse_path(cx, cy, rx, ry) if rx > 0 and ry > 0 else []
+        return None
+
+    def walk_shape(self, el, tag, m, s):
         if tag in ("svg", "g"):
             for child in el:
                 self.walk(child, m, s)
         elif tag == "use":
-            target = self.ids[el.get(XLINK_HREF, el.get("href", ""))[1:]]
-            x, y = float(el.get("x", 0)), float(el.get("y", 0))
-            ttag = target.tag.replace(SVG_NS, "")
-            if ttag == "symbol" and target.get("viewBox"):
-                vb = [float(v) for v in target.get("viewBox").split()]
-                w = float(el.get("width", vb[2]))
-                h = float(el.get("height", vb[3]))
-                inner = mat_mul(m, viewbox_matrix(vb, x, y, w, h, target.get("preserveAspectRatio")))
+            target = self.href(el)
+            if target.tag == SVG_NS + "symbol" and target.get("viewBox"):
+                inner = self.symbol_matrix(el, target, m)
                 ts = self.style(target, s)
                 for child in target:
                     self.walk(child, inner, ts)
             else:
+                x, y = float(el.get("x", 0)), float(el.get("y", 0))
                 self.walk(target, mat_mul(m, translate(x, y)), s)
-        elif tag == "path":
-            self.emit(m, s, parse_path(el.get("d", "")))
+        elif tag in ("path", "circle", "ellipse"):
+            self.emit(m, s, self.shape_subpaths(el, tag))
         elif tag == "rect":
             x, y = float(el.get("x", 0)), float(el.get("y", 0))
             w, h = float(el.get("width")), float(el.get("height"))
@@ -722,12 +564,6 @@ class Converter:
             rxx = rx if rx is not None else (ry or 0.0)
             ryy = ry if ry is not None else (rx or 0.0)
             self.emit(m, s, sub, (x, y, w, h, rxx, ryy))
-        elif tag in ("circle", "ellipse"):
-            cx, cy = float(el.get("cx", 0)), float(el.get("cy", 0))
-            rx = float(el.get("r" if tag == "circle" else "rx", 0))
-            ry = float(el.get("r" if tag == "circle" else "ry", 0))
-            if rx > 0 and ry > 0:
-                self.emit(m, s, ellipse_path(cx, cy, rx, ry))
         elif tag == "text":
             words = " ".join("".join(el.itertext()).split())
             self.warnings.append(f"skipped text {words[:40]!r} (TinyVG has no text)")
@@ -735,14 +571,18 @@ class Converter:
             self.warnings.append(f"skipped <{tag}>")
 
     def convert(self):
-        vb = [float(v) for v in self.root.get("viewBox").split()]
-        width, height = round(vb[2]), round(vb[3])
+        width, height, m = page_matrix(self.root)
         self.page = (width, height)
-        m = viewbox_matrix(vb, 0, 0, width, height, self.root.get("preserveAspectRatio"))
-        style = {"fill": "black", "stroke": "none", "stroke-width": "1"}
         for child in self.root:
-            self.walk(child, m, style)
+            self.walk(child, m, dict(DEFAULT_STYLE))
         return encode(width, height, self.colours, self.commands)
+
+
+def page_matrix(root):
+    """Image size in whole units, and the matrix from the root viewBox to it."""
+    vb = [float(v) for v in root.get("viewBox").split()]
+    width, height = round(vb[2]), round(vb[3])
+    return width, height, viewbox_matrix(vb, 0, 0, width, height, root.get("preserveAspectRatio"))
 
 
 # ---------------------------------------------------------------- encoder

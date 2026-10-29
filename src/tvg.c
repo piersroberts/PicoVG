@@ -1109,15 +1109,22 @@ int pvg_info(const uint8_t *data, size_t len, int index, int *width, int *height
 }
 
 int pvg_find(const uint8_t *data, size_t len, const char *name) {
-    int n = pvg_count(data, len);
-    size_t want = strlen(name);
-    for (int i = 0; i < n; i++) {
-        const char *got;
-        size_t got_len;
-        if (pvg_info(data, len, i, NULL, NULL, &got, &got_len) != 0) return -1;
-        if (got_len == want && memcmp(got, name, want) == 0) return i;
+    ctx c;
+    init_ctx(&c, data, len, NULL, 0);
+    if (setjmp(c.fail)) {
+        free_ctx(&c);
+        return -1;
     }
-    return -1;
+    uint32_t count = pvg_open(&c);
+    size_t want = strlen(name);
+    int found = -1;
+    for (uint32_t i = 0; i < count && found < 0; i++) {
+        // Seeking to index 0 reads the image at c->pos and moves past it.
+        pvg_image img = pvg_seek(&c, count, 0);
+        if (img.name_len == want && memcmp(img.name, name, want) == 0) found = (int)i;
+    }
+    free_ctx(&c);
+    return found;
 }
 
 uint8_t *pvg_render(const uint8_t *data, size_t len, int index, int width, int height,

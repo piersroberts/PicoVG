@@ -12,10 +12,11 @@ TinyVG can't reuse a shape, and stores every point as a 4 byte absolute coordina
 ## Build
 
 ```sh
-make  # builds pvg2png and tvgsheet
+make        # builds pvg2png and tvgsheet
+make .venv  # installs the converters' Python dependencies
 ```
 
-Needs a C compiler, zlib and Python 3. `tvgsheet` also needs SDL2 (`brew install sdl2`).
+Needs a C compiler, zlib and Python 3.10 or later. `tvgsheet` also needs SDL2 (`brew install sdl2`).
 
 ## Layout
 
@@ -33,8 +34,8 @@ Needs a C compiler, zlib and Python 3. `tvgsheet` also needs SDL2 (`brew install
 ## Tools
 
 ```sh
-python3 tools/svg2pvg.py [--tolerance units] [--grid n] out.pvg in.svg...
-python3 tools/svg2tvg.py in.svg out.tvg
+.venv/bin/python tools/svg2pvg.py [--tolerance units] [--grid n] out.pvg in.svg...
+.venv/bin/python tools/svg2tvg.py in.svg out.tvg
 ./pvg2png [-s factor] width in.pvg out_dir [name...]
 ./pvg2png [-s factor] width in.tvg out.png
 ./tvgsheet out.bmp cell_width columns file.tvg|file.pvg...
@@ -77,6 +78,7 @@ TinyVG and PicoVG have no patterns, text or square line caps, and TinyVG has no 
 - tile `userSpaceOnUse` patterns on rects, keeping only tiles fully inside the rect
 - store coordinates at 1/8 unit, which gzips about 18% better than 1/64 and looks the same
 - keep only the first and last stop of a gradient, and ignore a radial gradient's focal point
-- split a non-zero fill into even-odd fills when its subpaths overlap the same way round
-- ignore `clip-path` and `<text>`
+- rebuild a non-zero fill without overlaps (with [skia-pathops](https://github.com/fonttools/skia-pathops)) when even-odd would draw it differently
+- apply `clip-path` to fills by cutting the shape. Strokes and pattern fills ignore it.
+- ignore `<text>`
 - draw square line caps as round caps
