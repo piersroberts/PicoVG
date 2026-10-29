@@ -1,8 +1,18 @@
 # PicoVG
 
-PicoVG is [TinyVG](https://tinyvg.tech) with shared shapes and many images in one file. This repo has the [spec](docs/picovg.md), an SVG converter in Python and a small software renderer in C that reads both TinyVG and PicoVG.
+PicoVG is a small binary format for vector graphics (the "VG"), built on [TinyVG](https://tinyvg.tech). One PicoVG file holds a whole set of images, such as an icon set, and stores each repeated shape once.
 
-TinyVG can't reuse a shape, and stores every point as a 4 byte absolute coordinate. PicoVG adds:
+This repo has the [spec](docs/picovg.md), an SVG converter in Python and a small software renderer in C that reads both TinyVG and PicoVG.
+
+## The problem
+
+Apps and games often ship hundreds or thousands of small vector images. The usual formats are a poor fit for that:
+
+- SVG is text. It's large on disk, and drawing it needs an XML parser, CSS rules and a big renderer.
+- TinyVG fixes that for one image. It's binary, simple to parse and quick to draw. But each image is its own file, a shape can't be reused, and every point is a 4 byte absolute coordinate.
+- Icon sets repeat themselves. The same outline, badge or face shows up in many images, often in different colours or sizes. Separate files store it again every time.
+
+PicoVG keeps TinyVG's commands and rendering rules, and adds:
 
 - a symbol table, drawn with a `use symbol` command and a transform
 - a "current colour" style, so one symbol can be drawn in different colours
