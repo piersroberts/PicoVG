@@ -1,0 +1,9 @@
+# Built binaries
+pvg2png
+tvgsheet
+
+# Python
+__pycache__/
+
+# macOS
+.DS_Store
